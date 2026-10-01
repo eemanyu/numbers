@@ -4,6 +4,77 @@ const result = document.getElementById("result");
 const captureButton = document.getElementById("capture-button");
 
 let reading = false;
+let barcodeDetector = null;
+let barcodeScanActive = false;
+let lastBarcode = "";
+let lastBarcodeTime = 0;
+
+async function startBarcodeScanner() {
+  if (!("BarcodeDetector" in window)) {
+    console.log("BarcodeDetector não é suportado neste navegador.");
+    return;
+  }
+
+  try {
+    const supported = await BarcodeDetector.getSupportedFormats();
+    const formats = supported.filter(format =>
+      [
+        "aztec",
+        "code_128",
+        "code_39",
+        "code_93",
+        "codabar",
+        "data_matrix",
+        "ean_13",
+        "ean_8",
+        "itf",
+        "pdf417",
+        "qr_code",
+        "upc_a",
+        "upc_e"
+      ].includes(format)
+    );
+
+    if (!formats.length) return;
+
+    barcodeDetector = new BarcodeDetector({ formats });
+    barcodeScanActive = true;
+
+    const scan = async () => {
+      if (!barcodeScanActive || !barcodeDetector || video.readyState < 2) {
+        if (barcodeScanActive) requestAnimationFrame(scan);
+        return;
+      }
+
+      try {
+        const barcodes = await barcodeDetector.detect(video);
+
+        for (const barcode of barcodes) {
+          const value = String(barcode.rawValue || "").trim();
+
+          if (!value) continue;
+
+          // Enquanto o mesmo código continuar diante da câmera,
+          // registra apenas uma vez. Depois de 1,5 s ele pode ser lido novamente.
+          const now = Date.now();
+          if (value !== lastBarcode || now - lastBarcodeTime > 1500) {
+            registerNumber(normalizeNumber(value));
+            lastBarcode = value;
+            lastBarcodeTime = now;
+          }
+        }
+      } catch (error) {
+        console.error("Barcode recognition error:", error);
+      }
+
+      requestAnimationFrame(scan);
+    };
+
+    scan();
+  } catch (error) {
+    console.error("BarcodeDetector initialization error:", error);
+  }
+}
 
 async function startCamera() {
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -21,6 +92,7 @@ async function startCamera() {
 
   video.srcObject = stream;
   await video.play();
+  startBarcodeScanner();
 }
 
 function registerNumber(number) {
