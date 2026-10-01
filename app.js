@@ -1,14 +1,21 @@
-import { PaddleOCR } from "@paddleocr/paddleocr-js";
+import { BrowserMultiFormatReader } from "@zxing/browser";
 
 const video = document.getElementById("camera");
 const canvas = document.getElementById("canvas");
 const result = document.getElementById("result");
 
-let ocr;
 let recognizing = false;
+let barcodeDetector = null;
+let zxingReader = null;
+let zxingControls = null;
+
 let candidate = "";
 let candidateHits = 0;
-const registeredNumbers = new Set();
+let registeredNumbers = new Set();
+let cooldownUntil = 0;
+
+const RECOGNITION_INTERVAL = 650;
+const CONFIRMATION_FRAMES = 2;
 
 async function startCamera() {
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -28,25 +35,42 @@ async function startCamera() {
   await video.play();
 }
 
-async function startOCR() {
-  // PaddleOCR.js roda PP-OCRv5 no navegador.
-  // Worker + WASM evita travar a interface durante a inferência.
-  // Os headers COOP/COEP do Vercel permitem WASM com threads.
-  ocr = await PaddleOCR.create({
-    lang: "en",
-    ocrVersion: "PP-OCRv5",
-    worker: true,
-    textDetectionBatchSize: 1,
-    textRecognitionBatchSize: 4,
-    ortOptions: {
-      backend: "wasm",
-      wasmPaths: "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/",
-      numThreads: 2,
-      simd: true
+function loadRegisteredNumbers() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("numbers-registered") || "[]");
+    if (Array.isArray(saved)) {
+      registeredNumbers = new Set(
+        saved.filter(value => typeof value === "string" && /^\d+$/.test(value))
+      );
     }
-  });
+  } catch {
+    registeredNumbers = new Set();
+  }
 
-  requestAnimationFrame(ocrLoop);
+  result.value = [...registeredNumbers].join("\n");
+}
+
+function saveRegisteredNumbers() {
+  localStorage.setItem(
+    "numbers-registered",
+    JSON.stringify([...registeredNumbers])
+  );
+}
+
+function registerNumber(number) {
+  if (!number || registeredNumbers.has(number)) return false;
+
+  registeredNumbers.add(number);
+  result.value += (result.value ? "\n" : "") + number;
+  result.scrollTop = result.scrollHeight;
+  saveRegisteredNumbers();
+  return true;
+}
+
+function normalizeNumber(value) {
+  return String(value || "")
+    .replace(/[^0-9]/g, "")
+    .slice(0, 20);
 }
 
 function drawTarget() {
@@ -55,14 +79,14 @@ function drawTarget() {
   const width = video.videoWidth;
   const height = video.videoHeight;
 
-  // Só a área central da mira entra no PaddleOCR.
-  // Assim ele não tenta ler todos os números que aparecem na câmera.
-  const sx = Math.round(width * 0.12);
+  // Crop menor e centralizado para impedir que o modelo tente ler
+  // todos os números que aparecem na câmera.
+  const sx = Math.round(width * 0.20);
   const sy = Math.round(height * 0.36);
-  const sw = Math.round(width * 0.76);
+  const sw = Math.round(width * 0.60);
   const sh = Math.round(height * 0.28);
 
-  const scale = Math.min(2.5, 1800 / sw);
+  const scale = Math.min(2.2, 1600 / sw);
   canvas.width = Math.max(1, Math.floor(sw * scale));
   canvas.height = Math.max(1, Math.floor(sh * scale));
 
@@ -72,116 +96,184 @@ function drawTarget() {
   return true;
 }
 
-function normalizeNumber(text) {
-  return text
-    .toUpperCase()
-    .replace(/[OQD]/g, "0")
-    .replace(/[IL|]/g, "1")
-    .replace(/Z/g, "2")
-    .replace(/S/g, "5")
-    .replace(/G/g, "6")
-    .replace(/B/g, "8")
-    .replace(/[^0-9]/g, "");
-}
-
-function extractOneNumber(items) {
-  const candidates = items
-    .map(item => ({
-      text: item.text || "",
-      score: Number(item.score || 0)
-    }))
-    .filter(item => item.score >= 0.45)
-    .map(item => ({
-      number: normalizeNumber(item.text),
-      score: item.score
-    }))
-    .filter(item => item.number.length > 0);
-
-  if (!candidates.length) return "";
-
-  // A mira deve conter um único número.
-  // Se o detector encontrar mais de uma linha, usamos a de maior confiança.
-  candidates.sort((a, b) => b.score - a.score);
-  return candidates[0].number;
-}
-
-function registerNumber(number) {
-  if (!number || registeredNumbers.has(number)) return;
-
-  registeredNumbers.add(number);
-  result.value += (result.value ? "\n" : "") + number;
-  result.scrollTop = result.scrollHeight;
-}
-
-async function recognizeTarget() {
-  if (!drawTarget()) return;
+async function setupBarcodeDetector() {
+  if (!("BarcodeDetector" in window)) return;
 
   try {
-    const [prediction] = await ocr.predict(canvas, {
-      textDetLimitSideLen: 960,
-      textDetThresh: 0.25,
-      textDetBoxThresh: 0.35,
-      textDetUnclipRatio: 1.8,
-      textRecScoreThresh: 0.35
+    const supported = await BarcodeDetector.getSupportedFormats();
+
+    const preferred = [
+      "ean_13",
+      "ean_8",
+      "upc_a",
+      "upc_e",
+      "code_128",
+      "code_39",
+      "code_93",
+      "itf",
+      "codabar"
+    ];
+
+    const formats = preferred.filter(format => supported.includes(format));
+
+    barcodeDetector = formats.length
+      ? new BarcodeDetector({ formats })
+      : new BarcodeDetector();
+  } catch (error) {
+    console.warn("BarcodeDetector indisponível:", error);
+    barcodeDetector = null;
+  }
+}
+
+async function setupZXingFallback() {
+  if (barcodeDetector) return;
+
+  try {
+    zxingReader = new BrowserMultiFormatReader();
+
+    zxingControls = await zxingReader.decodeFromVideoElement(
+      video,
+      decoded => {
+        if (!decoded || Date.now() < cooldownUntil) return;
+
+        const number = normalizeNumber(decoded.getText());
+
+        if (number) {
+          registerNumber(number);
+          candidate = "";
+          candidateHits = 0;
+          cooldownUntil = Date.now() + 800;
+        }
+      }
+    );
+  } catch (error) {
+    console.warn("ZXing fallback indisponível:", error);
+    zxingReader = null;
+    zxingControls = null;
+  }
+}
+
+async function detectBarcode() {
+  if (!barcodeDetector || Date.now() < cooldownUntil) return false;
+
+  try {
+    const codes = await barcodeDetector.detect(video);
+
+    if (!codes?.length) return false;
+
+    // Se houver mais de um, usa apenas o código cujo centro
+    // estiver mais próximo do centro da câmera.
+    const cx = video.videoWidth / 2;
+    const cy = video.videoHeight / 2;
+
+    codes.sort((a, b) => {
+      const ax = (a.boundingBox?.x || 0) + (a.boundingBox?.width || 0) / 2;
+      const ay = (a.boundingBox?.y || 0) + (a.boundingBox?.height || 0) / 2;
+      const bx = (b.boundingBox?.x || 0) + (b.boundingBox?.width || 0) / 2;
+      const by = (b.boundingBox?.y || 0) + (b.boundingBox?.height || 0) / 2;
+
+      return Math.hypot(ax - cx, ay - cy) - Math.hypot(bx - cx, by - cy);
     });
 
-    const number = extractOneNumber(prediction?.items || []);
+    const number = normalizeNumber(codes[0].rawValue);
 
-    if (!number) {
-      candidate = "";
-      candidateHits = 0;
-      return;
-    }
+    if (!number) return false;
 
-    if (number === candidate) {
-      candidateHits++;
-    } else {
-      candidate = number;
-      candidateHits = 1;
-    }
-
-    // Confirma a mesma leitura em dois ciclos consecutivos.
-    if (candidateHits >= 2) {
-      registerNumber(number);
-      candidate = "";
-      candidateHits = 0;
-
-      // Dá tempo para tirar o número da mira.
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
+    registerNumber(number);
+    candidate = "";
+    candidateHits = 0;
+    cooldownUntil = Date.now() + 800;
+    return true;
   } catch (error) {
-    console.error("PaddleOCR error:", error);
+    console.warn("BarcodeDetector error:", error);
+    return false;
+  }
+}
+
+async function recognizeHandwrittenNumber() {
+  if (Date.now() < cooldownUntil || !drawTarget()) return;
+
+  const image = canvas.toDataURL("image/jpeg", 0.72);
+
+  const response = await fetch("/api/ler", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ image })
+  });
+
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || "Falha na leitura do número.");
+  }
+
+  const data = await response.json();
+  const number = normalizeNumber(data.number);
+
+  if (!number) {
+    candidate = "";
+    candidateHits = 0;
+    return;
+  }
+
+  if (number === candidate) {
+    candidateHits++;
+  } else {
+    candidate = number;
+    candidateHits = 1;
+  }
+
+  // Só registra quando dois frames consecutivos concordarem.
+  if (candidateHits >= CONFIRMATION_FRAMES) {
+    if (registerNumber(number)) {
+      cooldownUntil = Date.now() + 900;
+    }
+
+    candidate = "";
+    candidateHits = 0;
   }
 }
 
 async function recognizeFrame() {
-  if (recognizing || !ocr || video.readyState < 2) return;
+  if (recognizing || video.readyState < 2) return;
 
   recognizing = true;
 
   try {
-    await recognizeTarget();
+    // Código de barras: leitura local, imediata, sem enviar imagem.
+    if (await detectBarcode()) return;
+
+    // Handwriting/números impressos: Gemini lê somente o recorte central.
+    await recognizeHandwrittenNumber();
+  } catch (error) {
+    console.error("Recognition error:", error);
+    candidate = "";
+    candidateHits = 0;
   } finally {
     recognizing = false;
   }
 }
 
-async function ocrLoop() {
+async function recognitionLoop() {
   await recognizeFrame();
-  setTimeout(() => requestAnimationFrame(ocrLoop), 80);
+  setTimeout(() => requestAnimationFrame(recognitionLoop), RECOGNITION_INTERVAL);
 }
 
 async function init() {
   try {
+    loadRegisteredNumbers();
     await startCamera();
-    await startOCR();
+    await setupBarcodeDetector();
+    await setupZXingFallback();
+    requestAnimationFrame(recognitionLoop);
   } catch (error) {
     console.error(error);
 
     const message =
       error.name === "NotAllowedError"
         ? "Permita o acesso à câmera para continuar."
-        : error.message || "Não foi possível iniciar o PaddleOCR.";
+        : error.message || "Não foi possível iniciar a câmera.";
 
     const status = document.createElement("div");
     status.className = "error";
@@ -192,7 +284,8 @@ async function init() {
 
 window.addEventListener("beforeunload", () => {
   video.srcObject?.getTracks().forEach(track => track.stop());
-  ocr?.dispose?.();
+  zxingControls?.stop?.();
+  zxingReader?.reset?.();
 });
 
 init();
