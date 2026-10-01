@@ -4,7 +4,6 @@ const result = document.getElementById("result");
 const captureButton = document.getElementById("capture-button");
 
 let reading = false;
-let registeredNumbers = new Set();
 
 async function startCamera() {
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -24,36 +23,11 @@ async function startCamera() {
   await video.play();
 }
 
-function loadRegisteredNumbers() {
-  try {
-    const saved = JSON.parse(localStorage.getItem("numbers-registered") || "[]");
-
-    if (Array.isArray(saved)) {
-      registeredNumbers = new Set(
-        saved.filter(value => typeof value === "string" && /^\d+$/.test(value))
-      );
-    }
-  } catch {
-    registeredNumbers = new Set();
-  }
-
-  result.value = [...registeredNumbers].join("\n");
-}
-
-function saveRegisteredNumbers() {
-  localStorage.setItem(
-    "numbers-registered",
-    JSON.stringify([...registeredNumbers])
-  );
-}
-
 function registerNumber(number) {
-  if (!number || registeredNumbers.has(number)) return false;
+  if (!number) return false;
 
-  registeredNumbers.add(number);
   result.value += (result.value ? "\n" : "") + number;
   result.scrollTop = result.scrollHeight;
-  saveRegisteredNumbers();
   return true;
 }
 
@@ -139,8 +113,10 @@ async function readNumber() {
 }
 
 async function init() {
+  // O resultado não é salvo: cada recarregamento começa com a lista vazia.
+  result.value = "";
+
   try {
-    loadRegisteredNumbers();
     await startCamera();
   } catch (error) {
     console.error(error);
@@ -158,6 +134,14 @@ async function init() {
 }
 
 captureButton.addEventListener("click", readNumber);
+
+// Duplo clique seleciona o número inteiro para facilitar a cópia.
+result.addEventListener("dblclick", () => {
+  if (!result.value) return;
+
+  result.focus();
+  result.select();
+});
 
 window.addEventListener("beforeunload", () => {
   video.srcObject?.getTracks().forEach(track => track.stop());
