@@ -1,13 +1,10 @@
 const video = document.getElementById("camera");
 const canvas = document.getElementById("canvas");
 const result = document.getElementById("result");
-const copyButton = document.getElementById("copy");
-const cameraStatus = document.getElementById("camera-status");
-const ocrStatus = document.getElementById("ocr-status");
 
 let worker;
 let recognizing = false;
-let lastResult = "";
+const registeredNumbers = new Set();
 
 async function startCamera() {
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -25,12 +22,9 @@ async function startCamera() {
 
   video.srcObject = stream;
   await video.play();
-  cameraStatus.textContent = "Aponte a câmera para os números";
 }
 
 async function startOCR() {
-  ocrStatus.textContent = "Carregando OCR…";
-
   worker = await Tesseract.createWorker("eng");
 
   await worker.setParameters({
@@ -40,24 +34,18 @@ async function startOCR() {
     user_defined_dpi: "300"
   });
 
-  ocrStatus.textContent = "OCR pronto";
   requestAnimationFrame(ocrLoop);
 }
 
-function prepareFrame(mode = "gray") {
-  const sourceWidth = video.videoWidth;
-  const sourceHeight = video.videoHeight;
+function drawFrame(mode = "gray", sx = 0, sy = 0, sw = video.videoWidth, sh = video.videoHeight) {
+  if (!video.videoWidth || !video.videoHeight) return false;
 
-  if (!sourceWidth || !sourceHeight) return false;
-
-  // Processa TODA a imagem da câmera, não apenas a caixa central.
-  const scale = Math.min(2, 1600 / sourceWidth);
-
-  canvas.width = Math.floor(sourceWidth * scale);
-  canvas.height = Math.floor(sourceHeight * scale);
+  const scale = Math.min(2.5, 1800 / sw);
+  canvas.width = Math.max(1, Math.floor(sw * scale));
+  canvas.height = Math.max(1, Math.floor(sh * scale));
 
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
 
   const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const data = image.data;
@@ -69,16 +57,17 @@ function prepareFrame(mode = "gray") {
       data[i + 2] * 0.114
     );
 
+    let value = gray;
+
     if (mode === "threshold") {
-      const value = gray > 145 ? 255 : 0;
-      data[i] = value;
-      data[i + 1] = value;
-      data[i + 2] = value;
-    } else {
-      data[i] = gray;
-      data[i + 1] = gray;
-      data[i + 2] = gray;
+      value = gray > 145 ? 255 : 0;
+    } else if (mode === "high-contrast") {
+      value = Math.max(0, Math.min(255, (gray - 128) * 1.7 + 128));
     }
+
+    data[i] = value;
+    data[i + 1] = value;
+    data[i + 2] = value;
   }
 
   ctx.putImageData(image, 0, 0);
@@ -97,19 +86,64 @@ function normalizeOCR(text) {
 
 function extractNumbers(text) {
   const normalized = normalizeOCR(text);
-  return (normalized.match(/\d+/g) || []).join(" ");
+  return normalized.match(/\d+/g) || [];
 }
 
-function mergeResults(results) {
-  const values = results
-    .map(extractNumbers)
-    .filter(Boolean);
+function addNumbers(numbers) {
+  let changed = false;
 
-  if (!values.length) return "";
+  for (const number of numbers) {
+    if (!number || registeredNumbers.has(number)) continue;
 
-  // Mantém todas as sequências encontradas pelas diferentes
-  // pré-processamentos, removendo apenas duplicatas exatas.
-  return [...new Set(values.join(" ").split(/\s+/).filter(Boolean))].join(" ");
+    registeredNumbers.add(number);
+    result.value += (result.value ? "\n" : "") + number;
+    changed = true;
+  }
+
+  if (changed) {
+    result.scrollTop = result.scrollHeight;
+  }
+}
+
+async function recognizeCurrentFrame() {
+  const passes = [];
+  const width = video.videoWidth;
+  const height = video.videoHeight;
+
+  // 1) Quadro inteiro: encontra números espalhados pela câmera.
+  passes.push({ mode: "gray", sx: 0, sy: 0, sw: width, sh: height });
+
+  // 2) Quatro áreas sobrepostas: aumenta a resolução efetiva dos números pequenos.
+  const overlap = 0.10;
+  const halfW = width / 2;
+  const halfH = height / 2;
+  const cropW = halfW * (1 + overlap);
+  const cropH = halfH * (1 + overlap);
+
+  passes.push(
+    { mode: "gray", sx: 0, sy: 0, sw: cropW, sh: cropH },
+    { mode: "gray", sx: width - cropW, sy: 0, sw: cropW, sh: cropH },
+    { mode: "gray", sx: 0, sy: height - cropH, sw: cropW, sh: cropH },
+    { mode: "gray", sx: width - cropW, sy: height - cropH, sw: cropW, sh: cropH },
+
+    // Threshold apenas no quadro inteiro; ajuda em números de baixo contraste.
+    { mode: "threshold", sx: 0, sy: 0, sw: width, sh: height }
+  );
+
+  const found = [];
+
+  for (const pass of passes) {
+    if (!drawFrame(pass.mode, pass.sx, pass.sy, pass.sw, pass.sh)) continue;
+
+    try {
+      const resultData = await worker.recognize(canvas);
+      found.push(...extractNumbers(resultData.data.text));
+    } catch (error) {
+      console.error("OCR pass error:", error);
+    }
+  }
+
+  addNumbers(found);
 }
 
 async function recognizeFrame() {
@@ -118,28 +152,7 @@ async function recognizeFrame() {
   recognizing = true;
 
   try {
-    const recognized = [];
-
-    // Primeira passada: imagem em tons de cinza.
-    if (prepareFrame("gray")) {
-      const first = await worker.recognize(canvas);
-      recognized.push(first.data.text);
-    }
-
-    // Segunda passada: alto contraste/threshold.
-    // Isso recupera números que o primeiro processamento perde.
-    if (prepareFrame("threshold")) {
-      const second = await worker.recognize(canvas);
-      recognized.push(second.data.text);
-    }
-
-    const numbers = mergeResults(recognized);
-
-    if (numbers && numbers !== lastResult) {
-      lastResult = numbers;
-      result.value = numbers;
-      copyButton.disabled = false;
-    }
+    await recognizeCurrentFrame();
   } catch (error) {
     console.error("OCR error:", error);
   } finally {
@@ -149,25 +162,11 @@ async function recognizeFrame() {
 
 async function ocrLoop() {
   await recognizeFrame();
-  setTimeout(() => requestAnimationFrame(ocrLoop), 100);
+
+  // O próximo ciclo só começa depois que o anterior termina.
+  // Isso evita acumular centenas de reconhecimentos simultâneos no celular.
+  setTimeout(() => requestAnimationFrame(ocrLoop), 150);
 }
-
-copyButton.addEventListener("click", async () => {
-  if (!result.value) return;
-
-  try {
-    await navigator.clipboard.writeText(result.value);
-  } catch {
-    result.focus();
-    result.select();
-    document.execCommand("copy");
-  }
-
-  copyButton.textContent = "Copiado";
-  setTimeout(() => {
-    copyButton.textContent = "Copiar";
-  }, 1000);
-});
 
 async function init() {
   try {
@@ -176,12 +175,15 @@ async function init() {
   } catch (error) {
     console.error(error);
 
-    cameraStatus.textContent =
+    const message =
       error.name === "NotAllowedError"
-        ? "Permita o acesso à câmera para continuar"
-        : error.message || "Não foi possível abrir a câmera";
+        ? "Permita o acesso à câmera para continuar."
+        : error.message || "Não foi possível abrir a câmera.";
 
-    ocrStatus.textContent = "Não iniciado";
+    const status = document.createElement("div");
+    status.className = "error";
+    status.textContent = message;
+    document.querySelector(".camera-panel").appendChild(status);
   }
 }
 
