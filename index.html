@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#000000">
+<title>Numbers</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="app">
+<section class="camera-panel">
+<video id="camera" autoplay playsinline muted></video>
+<div class="scan-frame" aria-hidden="true"></div>
+<div id="camera-status" class="status">Abrindo câmera…</div>
+</section>
+<section class="result-panel">
+<header class="result-header">
+<img src="numbers-icon.jpg" alt="" class="result-icon">
+<h1>Números lidos</h1>
+</header>
+<div class="result-content">
+<div class="result-row">
+<textarea id="result" readonly aria-label="Números identificados"></textarea>
+<button id="copy" type="button" disabled>Copiar</button>
+</div>
+<span id="ocr-status" class="status">Inicializando OCR…</span>
+</div>
+</section>
+</main>
+<canvas id="canvas" hidden></canvas>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
