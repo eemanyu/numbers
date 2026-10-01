@@ -19,17 +19,13 @@ export default async function handler(request, response) {
     const image = body?.image;
 
     if (typeof image !== "string" || !image.startsWith("data:image/")) {
-      return response.status(400).json({
-        error: "Imagem inválida."
-      });
+      return response.status(400).json({ error: "Imagem inválida." });
     }
 
     const match = image.match(/^data:(image\/[^;]+);base64,(.+)$/s);
 
     if (!match) {
-      return response.status(400).json({
-        error: "Formato de imagem inválido."
-      });
+      return response.status(400).json({ error: "Formato de imagem inválido." });
     }
 
     const mimeType = match[1];
@@ -44,8 +40,8 @@ export default async function handler(request, response) {
       "Não concatene números diferentes.",
       "Não invente dígitos.",
       "Se não houver um único número claramente legível no centro, retorne uma string vazia.",
-      "Responda SOMENTE em JSON no formato: {"number":"123"}.",
-      "Se não conseguir ler, responda: {"number":""}."
+      "Responda SOMENTE em JSON no formato {\"number\":\"123\"}.",
+      "Se não conseguir ler, responda {\"number\":\"\"}."
     ].join(" ");
 
     const geminiResponse = await fetch(
@@ -57,19 +53,17 @@ export default async function handler(request, response) {
           "x-goog-api-key": apiKey
         },
         body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                { text: prompt },
-                {
-                  inline_data: {
-                    mime_type: mimeType,
-                    data: base64Data
-                  }
+          contents: [{
+            parts: [
+              { text: prompt },
+              {
+                inline_data: {
+                  mime_type: mimeType,
+                  data: base64Data
                 }
-              ]
-            }
-          ],
+              }
+            ]
+          }],
           generationConfig: {
             responseMimeType: "application/json",
             maxOutputTokens: 32
@@ -107,9 +101,6 @@ export default async function handler(request, response) {
     return response.status(200).json({ number });
   } catch (error) {
     console.error("OCR server error:", error);
-
-    return response.status(500).json({
-      error: "Erro interno ao ler o número."
-    });
+    return response.status(500).json({ error: "Erro interno ao ler o número." });
   }
 }
