@@ -1,8 +1,10 @@
+import { PaddleOCR } from "@paddleocr/paddleocr-js";
+
 const video = document.getElementById("camera");
 const canvas = document.getElementById("canvas");
 const result = document.getElementById("result");
 
-let worker;
+let ocr;
 let recognizing = false;
 let candidate = "";
 let candidateHits = 0;
@@ -27,85 +29,80 @@ async function startCamera() {
 }
 
 async function startOCR() {
-  worker = await Tesseract.createWorker("eng");
-
-  // PSM 8 = trata a região como UMA única palavra/número.
-  // Isso é intencional: não queremos ler todos os números da câmera.
-  await worker.setParameters({
-    tessedit_char_whitelist: "0123456789",
-    tessedit_pageseg_mode: "8",
-    user_defined_dpi: "300",
-    classify_bln_numeric_mode: "1"
+  // PaddleOCR.js roda PP-OCRv5 no navegador.
+  // Worker + WASM evita travar a interface durante a inferência.
+  // Os headers COOP/COEP do Vercel permitem WASM com threads.
+  ocr = await PaddleOCR.create({
+    lang: "en",
+    ocrVersion: "PP-OCRv5",
+    worker: true,
+    textDetectionBatchSize: 1,
+    textRecognitionBatchSize: 4,
+    ortOptions: {
+      backend: "wasm",
+      wasmPaths: "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/",
+      numThreads: 2,
+      simd: true
+    }
   });
 
   requestAnimationFrame(ocrLoop);
 }
 
-function drawTarget(mode = "gray") {
+function drawTarget() {
   if (!video.videoWidth || !video.videoHeight) return false;
 
   const width = video.videoWidth;
   const height = video.videoHeight;
 
-  // Região central correspondente à área de mira.
-  // Só esta área é enviada ao OCR.
+  // Só a área central da mira entra no PaddleOCR.
+  // Assim ele não tenta ler todos os números que aparecem na câmera.
   const sx = Math.round(width * 0.12);
   const sy = Math.round(height * 0.36);
   const sw = Math.round(width * 0.76);
   const sh = Math.round(height * 0.28);
 
-  const scale = Math.min(3, 1800 / sw);
+  const scale = Math.min(2.5, 1800 / sw);
   canvas.width = Math.max(1, Math.floor(sw * scale));
   canvas.height = Math.max(1, Math.floor(sh * scale));
 
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
 
-  const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const data = image.data;
-
-  for (let i = 0; i < data.length; i += 4) {
-    const gray = Math.round(
-      data[i] * 0.299 +
-      data[i + 1] * 0.587 +
-      data[i + 2] * 0.114
-    );
-
-    let value = gray;
-
-    if (mode === "threshold") {
-      value = gray > 145 ? 255 : 0;
-    } else if (mode === "contrast") {
-      value = Math.max(0, Math.min(255, (gray - 128) * 1.8 + 128));
-    }
-
-    data[i] = value;
-    data[i + 1] = value;
-    data[i + 2] = value;
-  }
-
-  ctx.putImageData(image, 0, 0);
   return true;
 }
 
-function normalizeOCR(text) {
+function normalizeNumber(text) {
   return text
     .toUpperCase()
     .replace(/[OQD]/g, "0")
     .replace(/[IL|]/g, "1")
     .replace(/Z/g, "2")
-    .replace(/[S]/g, "5")
+    .replace(/S/g, "5")
     .replace(/G/g, "6")
-    .replace(/B/g, "8");
+    .replace(/B/g, "8")
+    .replace(/[^0-9]/g, "");
 }
 
-function extractOneNumber(text) {
-  const normalized = normalizeOCR(text);
-  const matches = normalized.match(/\d+/g) || [];
+function extractOneNumber(items) {
+  const candidates = items
+    .map(item => ({
+      text: item.text || "",
+      score: Number(item.score || 0)
+    }))
+    .filter(item => item.score >= 0.45)
+    .map(item => ({
+      number: normalizeNumber(item.text),
+      score: item.score
+    }))
+    .filter(item => item.number.length > 0);
 
-  // Apenas UMA leitura por ciclo.
-  // Se o OCR enxergar vários grupos, usamos somente o primeiro.
-  return matches[0] || "";
+  if (!candidates.length) return "";
+
+  // A mira deve conter um único número.
+  // Se o detector encontrar mais de uma linha, usamos a de maior confiança.
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].number;
 }
 
 function registerNumber(number) {
@@ -117,72 +114,53 @@ function registerNumber(number) {
 }
 
 async function recognizeTarget() {
-  const readings = [];
+  if (!drawTarget()) return;
 
-  // Duas versões da mesma região aumentam a chance de reconhecer
-  // impressão e números escritos à mão.
-  for (const mode of ["gray", "contrast", "threshold"]) {
-    if (!drawTarget(mode)) continue;
+  try {
+    const [prediction] = await ocr.predict(canvas, {
+      textDetLimitSideLen: 960,
+      textDetThresh: 0.25,
+      textDetBoxThresh: 0.35,
+      textDetUnclipRatio: 1.8,
+      textRecScoreThresh: 0.35
+    });
 
-    try {
-      const data = await worker.recognize(canvas);
-      const number = extractOneNumber(data.data.text);
+    const number = extractOneNumber(prediction?.items || []);
 
-      if (number) {
-        readings.push(number);
-      }
-    } catch (error) {
-      console.error("OCR pass error:", error);
+    if (!number) {
+      candidate = "";
+      candidateHits = 0;
+      return;
     }
-  }
 
-  if (!readings.length) {
-    candidate = "";
-    candidateHits = 0;
-    return;
-  }
+    if (number === candidate) {
+      candidateHits++;
+    } else {
+      candidate = number;
+      candidateHits = 1;
+    }
 
-  // Escolhe a leitura mais repetida nas 3 passagens.
-  const counts = new Map();
-  for (const value of readings) {
-    counts.set(value, (counts.get(value) || 0) + 1);
-  }
+    // Confirma a mesma leitura em dois ciclos consecutivos.
+    if (candidateHits >= 2) {
+      registerNumber(number);
+      candidate = "";
+      candidateHits = 0;
 
-  const best = [...counts.entries()]
-    .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)[0];
-
-  const number = best[0];
-  const hits = best[1];
-
-  // Exige confirmação em mais de uma imagem antes de registrar.
-  // Isso reduz bastante falsos positivos enquanto a câmera se move.
-  if (number === candidate) {
-    candidateHits++;
-  } else {
-    candidate = number;
-    candidateHits = 1;
-  }
-
-  if (hits >= 2 && candidateHits >= 2) {
-    registerNumber(number);
-    candidate = "";
-    candidateHits = 0;
-
-    // Pequena pausa depois de registrar para a pessoa tirar o número
-    // da mira antes que ele possa ser interpretado novamente.
-    await new Promise(resolve => setTimeout(resolve, 500));
+      // Dá tempo para tirar o número da mira.
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  } catch (error) {
+    console.error("PaddleOCR error:", error);
   }
 }
 
 async function recognizeFrame() {
-  if (recognizing || !worker || video.readyState < 2) return;
+  if (recognizing || !ocr || video.readyState < 2) return;
 
   recognizing = true;
 
   try {
     await recognizeTarget();
-  } catch (error) {
-    console.error("OCR error:", error);
   } finally {
     recognizing = false;
   }
@@ -190,7 +168,7 @@ async function recognizeFrame() {
 
 async function ocrLoop() {
   await recognizeFrame();
-  setTimeout(() => requestAnimationFrame(ocrLoop), 120);
+  setTimeout(() => requestAnimationFrame(ocrLoop), 80);
 }
 
 async function init() {
@@ -203,7 +181,7 @@ async function init() {
     const message =
       error.name === "NotAllowedError"
         ? "Permita o acesso à câmera para continuar."
-        : error.message || "Não foi possível abrir a câmera.";
+        : error.message || "Não foi possível iniciar o PaddleOCR.";
 
     const status = document.createElement("div");
     status.className = "error";
@@ -214,7 +192,7 @@ async function init() {
 
 window.addEventListener("beforeunload", () => {
   video.srcObject?.getTracks().forEach(track => track.stop());
-  worker?.terminate();
+  ocr?.dispose?.();
 });
 
 init();
