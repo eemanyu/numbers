@@ -4,6 +4,8 @@ const result = document.getElementById("result");
 
 let worker;
 let recognizing = false;
+let candidate = "";
+let candidateHits = 0;
 const registeredNumbers = new Set();
 
 async function startCamera() {
@@ -27,20 +29,32 @@ async function startCamera() {
 async function startOCR() {
   worker = await Tesseract.createWorker("eng");
 
+  // PSM 8 = trata a região como UMA única palavra/número.
+  // Isso é intencional: não queremos ler todos os números da câmera.
   await worker.setParameters({
     tessedit_char_whitelist: "0123456789",
-    tessedit_pageseg_mode: "11",
-    preserve_interword_spaces: "1",
-    user_defined_dpi: "300"
+    tessedit_pageseg_mode: "8",
+    user_defined_dpi: "300",
+    classify_bln_numeric_mode: "1"
   });
 
   requestAnimationFrame(ocrLoop);
 }
 
-function drawFrame(mode = "gray", sx = 0, sy = 0, sw = video.videoWidth, sh = video.videoHeight) {
+function drawTarget(mode = "gray") {
   if (!video.videoWidth || !video.videoHeight) return false;
 
-  const scale = Math.min(2.5, 1800 / sw);
+  const width = video.videoWidth;
+  const height = video.videoHeight;
+
+  // Região central correspondente à área de mira.
+  // Só esta área é enviada ao OCR.
+  const sx = Math.round(width * 0.12);
+  const sy = Math.round(height * 0.36);
+  const sw = Math.round(width * 0.76);
+  const sh = Math.round(height * 0.28);
+
+  const scale = Math.min(3, 1800 / sw);
   canvas.width = Math.max(1, Math.floor(sw * scale));
   canvas.height = Math.max(1, Math.floor(sh * scale));
 
@@ -61,8 +75,8 @@ function drawFrame(mode = "gray", sx = 0, sy = 0, sw = video.videoWidth, sh = vi
 
     if (mode === "threshold") {
       value = gray > 145 ? 255 : 0;
-    } else if (mode === "high-contrast") {
-      value = Math.max(0, Math.min(255, (gray - 128) * 1.7 + 128));
+    } else if (mode === "contrast") {
+      value = Math.max(0, Math.min(255, (gray - 128) * 1.8 + 128));
     }
 
     data[i] = value;
@@ -76,74 +90,88 @@ function drawFrame(mode = "gray", sx = 0, sy = 0, sw = video.videoWidth, sh = vi
 
 function normalizeOCR(text) {
   return text
-    .replace(/[OoQ]/g, "0")
-    .replace(/[Il|]/g, "1")
+    .toUpperCase()
+    .replace(/[OQD]/g, "0")
+    .replace(/[IL|]/g, "1")
     .replace(/Z/g, "2")
-    .replace(/S/g, "5")
+    .replace(/[S]/g, "5")
     .replace(/G/g, "6")
     .replace(/B/g, "8");
 }
 
-function extractNumbers(text) {
+function extractOneNumber(text) {
   const normalized = normalizeOCR(text);
-  return normalized.match(/\d+/g) || [];
+  const matches = normalized.match(/\d+/g) || [];
+
+  // Apenas UMA leitura por ciclo.
+  // Se o OCR enxergar vários grupos, usamos somente o primeiro.
+  return matches[0] || "";
 }
 
-function addNumbers(numbers) {
-  let changed = false;
+function registerNumber(number) {
+  if (!number || registeredNumbers.has(number)) return;
 
-  for (const number of numbers) {
-    if (!number || registeredNumbers.has(number)) continue;
-
-    registeredNumbers.add(number);
-    result.value += (result.value ? "\n" : "") + number;
-    changed = true;
-  }
-
-  if (changed) {
-    result.scrollTop = result.scrollHeight;
-  }
+  registeredNumbers.add(number);
+  result.value += (result.value ? "\n" : "") + number;
+  result.scrollTop = result.scrollHeight;
 }
 
-async function recognizeCurrentFrame() {
-  const passes = [];
-  const width = video.videoWidth;
-  const height = video.videoHeight;
+async function recognizeTarget() {
+  const readings = [];
 
-  // 1) Quadro inteiro: encontra números espalhados pela câmera.
-  passes.push({ mode: "gray", sx: 0, sy: 0, sw: width, sh: height });
-
-  // 2) Quatro áreas sobrepostas: aumenta a resolução efetiva dos números pequenos.
-  const overlap = 0.10;
-  const halfW = width / 2;
-  const halfH = height / 2;
-  const cropW = halfW * (1 + overlap);
-  const cropH = halfH * (1 + overlap);
-
-  passes.push(
-    { mode: "gray", sx: 0, sy: 0, sw: cropW, sh: cropH },
-    { mode: "gray", sx: width - cropW, sy: 0, sw: cropW, sh: cropH },
-    { mode: "gray", sx: 0, sy: height - cropH, sw: cropW, sh: cropH },
-    { mode: "gray", sx: width - cropW, sy: height - cropH, sw: cropW, sh: cropH },
-
-    // Threshold apenas no quadro inteiro; ajuda em números de baixo contraste.
-    { mode: "threshold", sx: 0, sy: 0, sw: width, sh: height }
-  );
-
-  const found = [];
-
-  for (const pass of passes) {
-    if (!drawFrame(pass.mode, pass.sx, pass.sy, pass.sw, pass.sh)) continue;
+  // Duas versões da mesma região aumentam a chance de reconhecer
+  // impressão e números escritos à mão.
+  for (const mode of ["gray", "contrast", "threshold"]) {
+    if (!drawTarget(mode)) continue;
 
     try {
-      const resultData = await worker.recognize(canvas);
-      found.push(...extractNumbers(resultData.data.text));
+      const data = await worker.recognize(canvas);
+      const number = extractOneNumber(data.data.text);
+
+      if (number) {
+        readings.push(number);
+      }
     } catch (error) {
       console.error("OCR pass error:", error);
     }
   }
 
-  addNumbers(found);
+  if (!readings.length) {
+    candidate = "";
+    candidateHits = 0;
+    return;
+  }
+
+  // Escolhe a leitura mais repetida nas 3 passagens.
+  const counts = new Map();
+  for (const value of readings) {
+    counts.set(value, (counts.get(value) || 0) + 1);
+  }
+
+  const best = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)[0];
+
+  const number = best[0];
+  const hits = best[1];
+
+  // Exige confirmação em mais de uma imagem antes de registrar.
+  // Isso reduz bastante falsos positivos enquanto a câmera se move.
+  if (number === candidate) {
+    candidateHits++;
+  } else {
+    candidate = number;
+    candidateHits = 1;
+  }
+
+  if (hits >= 2 && candidateHits >= 2) {
+    registerNumber(number);
+    candidate = "";
+    candidateHits = 0;
+
+    // Pequena pausa depois de registrar para a pessoa tirar o número
+    // da mira antes que ele possa ser interpretado novamente.
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
 }
 
 async function recognizeFrame() {
@@ -152,7 +180,7 @@ async function recognizeFrame() {
   recognizing = true;
 
   try {
-    await recognizeCurrentFrame();
+    await recognizeTarget();
   } catch (error) {
     console.error("OCR error:", error);
   } finally {
@@ -162,10 +190,7 @@ async function recognizeFrame() {
 
 async function ocrLoop() {
   await recognizeFrame();
-
-  // O próximo ciclo só começa depois que o anterior termina.
-  // Isso evita acumular centenas de reconhecimentos simultâneos no celular.
-  setTimeout(() => requestAnimationFrame(ocrLoop), 150);
+  setTimeout(() => requestAnimationFrame(ocrLoop), 120);
 }
 
 async function init() {
