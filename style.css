@@ -5,7 +5,13 @@ html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#000;color:
 .camera-panel{display:flex;align-items:center;justify-content:center;overflow:hidden;background:#111}
 #camera{width:100%;height:100%;object-fit:cover}
 .scan-frame{position:absolute;left:8%;right:8%;top:35%;bottom:35%;border:2px solid rgba(255,255,255,.8);border-radius:12px;pointer-events:none}
-.error{position:absolute;left:16px;right:16px;bottom:16px;padding:10px 12px;border-radius:8px;background:rgba(0,0,0,.75);color:#fff;font-size:14px;text-align:center}
+.capture-button{position:absolute;z-index:5;left:50%;bottom:22px;transform:translateX(-50%);width:68px;height:68px;border-radius:50%;border:4px solid rgba(0,0,0,.25);background:#fff;padding:5px;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 18px rgba(0,0,0,.45);-webkit-tap-highlight-color:transparent}
+.capture-button span{display:block;width:100%;height:100%;border-radius:50%;border:2px solid #ddd;background:#fff}
+.capture-button:active{transform:translateX(-50%) scale(.94)}
+.capture-button:disabled{cursor:wait;opacity:.65}
+.capture-button.reading span{animation:pulse .8s ease-in-out infinite}
+@keyframes pulse{50%{transform:scale(.72)}}
+.error{position:absolute;left:16px;right:16px;bottom:100px;padding:10px 12px;border-radius:8px;background:rgba(0,0,0,.75);color:#fff;font-size:14px;text-align:center}
 .result-panel{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;background:#0b0b0b}
 .result-header{display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:20px;width:100%;max-width:560px}
 .result-header h1{margin:0;font-size:24px;font-weight:650;text-align:left}
@@ -21,4 +27,5 @@ html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#000;color:
   .result-icon{width:42px;height:42px}
   #result{height:calc(50dvh - 90px);min-height:120px;font-size:30px}
   .scan-frame{left:5%;right:5%;top:30%;bottom:30%}
+  .capture-button{width:64px;height:64px;bottom:18px}
 }
